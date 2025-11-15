@@ -5,11 +5,12 @@ from typing import List, Optional
 import torch
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
-import faiss
+from sklearn.neighbors import NearestNeighbors
 import numpy as np
 import io
 import os
 import json
+import pickle
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +29,7 @@ app.add_middleware(
 
 # Configuration
 MODEL_NAME = os.getenv("CLIP_MODEL_NAME", "openai/clip-vit-base-patch32")
-VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "./data/faiss_index")
+VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "./data/embeddings")
 METADATA_PATH = os.getenv("METADATA_PATH", "./data/metadata.json")
 
 # Initialize CLIP model
@@ -37,29 +38,36 @@ logger.info(f"Loading CLIP model: {MODEL_NAME} on {device}")
 model = CLIPModel.from_pretrained(MODEL_NAME).to(device)
 processor = CLIPProcessor.from_pretrained(MODEL_NAME)
 
-# Initialize FAISS index
+# Initialize vector storage using sklearn
 EMBEDDING_DIM = 512
-index = None
+embeddings_array = None
+nearest_neighbors = None
 metadata = []
 
 def load_or_create_index():
-    global index, metadata
+    global embeddings_array, nearest_neighbors, metadata
     os.makedirs(os.path.dirname(VECTOR_DB_PATH) or "./data", exist_ok=True)
     
-    if os.path.exists(f"{VECTOR_DB_PATH}.index"):
-        logger.info("Loading existing FAISS index")
-        index = faiss.read_index(f"{VECTOR_DB_PATH}.index")
+    if os.path.exists(f"{VECTOR_DB_PATH}.pkl"):
+        logger.info("Loading existing embeddings")
+        with open(f"{VECTOR_DB_PATH}.pkl", 'rb') as f:
+            embeddings_array = pickle.load(f)
         if os.path.exists(METADATA_PATH):
             with open(METADATA_PATH, 'r') as f:
                 metadata = json.load(f)
+        # Rebuild nearest neighbors index
+        if len(embeddings_array) > 0:
+            nearest_neighbors = NearestNeighbors(n_neighbors=min(10, len(embeddings_array)), metric='cosine')
+            nearest_neighbors.fit(embeddings_array)
     else:
-        logger.info("Creating new FAISS index")
-        index = faiss.IndexFlatL2(EMBEDDING_DIM)
+        logger.info("Creating new embeddings storage")
+        embeddings_array = np.array([]).reshape(0, EMBEDDING_DIM)
         metadata = []
         save_index()
 
 def save_index():
-    faiss.write_index(index, f"{VECTOR_DB_PATH}.index")
+    with open(f"{VECTOR_DB_PATH}.pkl", 'wb') as f:
+        pickle.dump(embeddings_array, f)
     with open(METADATA_PATH, 'w') as f:
         json.dump(metadata, f)
 
@@ -102,7 +110,7 @@ async def root():
     return {
         "service": "CLIP Similarity Search Service",
         "model": MODEL_NAME,
-        "total_items": index.ntotal,
+        "total_items": len(metadata),
         "device": device
     }
 
@@ -116,6 +124,7 @@ async def upload_item(
     description: Optional[str] = None
 ):
     """Upload a clothing item and generate its embedding."""
+    global embeddings_array, nearest_neighbors
     try:
         # Read and process image
         image_data = await file.read()
@@ -124,8 +133,8 @@ async def upload_item(
         # Generate embedding
         embedding = get_image_embedding(image)
         
-        # Add to FAISS index
-        index.add(np.array([embedding]))
+        # Add to embeddings array
+        embeddings_array = np.vstack([embeddings_array, embedding.reshape(1, -1)])
         
         # Store metadata
         if item_id is None:
@@ -141,6 +150,10 @@ async def upload_item(
         }
         metadata.append(item_metadata)
         
+        # Rebuild nearest neighbors index
+        nearest_neighbors = NearestNeighbors(n_neighbors=min(10, len(embeddings_array)), metric='cosine')
+        nearest_neighbors.fit(embeddings_array)
+        
         # Save index and metadata
         save_index()
         
@@ -148,7 +161,7 @@ async def upload_item(
         return {
             "success": True,
             "item_id": item_id,
-            "total_items": index.ntotal
+            "total_items": len(metadata)
         }
     except Exception as e:
         logger.error(f"Error uploading item: {e}")
@@ -158,7 +171,7 @@ async def upload_item(
 async def search_by_image(file: UploadFile = File(...), top_k: int = 5):
     """Search for similar items using an image."""
     try:
-        if index.ntotal == 0:
+        if len(metadata) == 0:
             return []
         
         # Read and process image
@@ -168,15 +181,16 @@ async def search_by_image(file: UploadFile = File(...), top_k: int = 5):
         # Generate embedding
         query_embedding = get_image_embedding(image)
         
-        # Search in FAISS
-        distances, indices = index.search(np.array([query_embedding]), min(top_k, index.ntotal))
+        # Search using nearest neighbors
+        k = min(top_k, len(embeddings_array))
+        distances, indices = nearest_neighbors.kneighbors([query_embedding], n_neighbors=k)
         
         # Prepare results
         results = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx < len(metadata):
-                # Convert L2 distance to similarity score (0-1, higher is better)
-                similarity_score = 1.0 / (1.0 + float(dist))
+                # Convert cosine distance to similarity score (0-1, higher is better)
+                similarity_score = 1.0 - float(dist)
                 results.append(SimilarityResult(
                     item_id=metadata[idx]["item_id"],
                     similarity_score=similarity_score,
@@ -192,7 +206,7 @@ async def search_by_image(file: UploadFile = File(...), top_k: int = 5):
 async def search_by_text(request: SearchRequest):
     """Search for items using text description."""
     try:
-        if index.ntotal == 0:
+        if len(metadata) == 0:
             return []
         
         if not request.query_text:
@@ -201,17 +215,15 @@ async def search_by_text(request: SearchRequest):
         # Generate text embedding
         query_embedding = get_text_embedding(request.query_text)
         
-        # Search in FAISS
-        distances, indices = index.search(
-            np.array([query_embedding]), 
-            min(request.top_k, index.ntotal)
-        )
+        # Search using nearest neighbors
+        k = min(request.top_k, len(embeddings_array))
+        distances, indices = nearest_neighbors.kneighbors([query_embedding], n_neighbors=k)
         
         # Prepare results
         results = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx < len(metadata):
-                similarity_score = 1.0 / (1.0 + float(dist))
+                similarity_score = 1.0 - float(dist)
                 results.append(SimilarityResult(
                     item_id=metadata[idx]["item_id"],
                     similarity_score=similarity_score,

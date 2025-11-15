@@ -41,7 +41,7 @@ def load_img2img_pipeline():
         img2img_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
             MODEL_NAME,
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            safety_checker=None
+            safety_checker=None 
         ).to(device)
         if device == "cuda":
             img2img_pipeline.enable_attention_slicing()
