@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
+from pathlib import Path
 from typing import List, Optional
 import google.generativeai as genai
 import os
@@ -8,6 +10,25 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+env_path = Path(__file__).parent.parent.parent / '.env'
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+    logging.info(f"Loaded environment variables")
+else:
+    logging.warning(f".env file not found at {env_path}, proceeding without loading environment variables.")
+
+
+# Helper function for consistent error handling
+def handle_exception(e: Exception, default_message: str = "An error occurred") -> HTTPException:
+    """Convert exceptions to HTTPException with proper status codes and details."""
+    if isinstance(e, HTTPException):
+        return e
+    
+    status_code = getattr(e, 'status_code', 500)
+    detail = getattr(e, 'detail', str(e)) if hasattr(e, 'detail') else str(e)
+    
+    return HTTPException(status_code=status_code, detail=detail or default_message)
 
 app = FastAPI(title="Gemini Outfit Recommendation Service")
 
@@ -28,7 +49,7 @@ else:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize model
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-2.5-flash')
 
 class OutfitRequest(BaseModel):
     prompt: str
@@ -162,8 +183,8 @@ async def recommend_outfit(request: OutfitRequest):
         }
         
     except Exception as e:
-        logger.error(f"Error generating recommendation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error generating recommendation:")
+        raise handle_exception(e, "Failed to generate recommendation")
 
 @app.post("/chat", response_model=dict)
 async def chat(request: ChatRequest):
@@ -195,8 +216,8 @@ async def chat(request: ChatRequest):
         }
         
     except Exception as e:
-        logger.error(f"Error in chat: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in chat")
+        raise handle_exception(e, "Failed to process chat request")
 
 @app.post("/analyze-outfit", response_model=dict)
 async def analyze_outfit(items: List[dict]):
@@ -232,8 +253,8 @@ async def analyze_outfit(items: List[dict]):
         }
         
     except Exception as e:
-        logger.error(f"Error analyzing outfit: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Error in analyzing outfit:")
+        raise handle_exception(e, "Failed to analyze outfit")
 
 if __name__ == "__main__":
     import uvicorn
